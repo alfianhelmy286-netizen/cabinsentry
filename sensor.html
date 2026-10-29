@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CabinSentry · Sensor (HP 1)</title>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+:root{--bg:#10151a;--panel:#192027;--line:#2a343e;--text:#e8edf1;--mute:#8a98a5;--ok:#2fbf71;--warn:#f0a30a;--bad:#e5484d;--idle:#4a5866}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom));max-width:520px;margin:0 auto}
+h1{font-size:1.25rem;margin:4px 0 2px}
+p.sub{margin:0 0 16px;color:var(--mute);font-size:.9rem}
+.status{border-radius:14px;padding:22px 16px;text-align:center;background:var(--idle);transition:background .2s}
+.status b{display:block;font-size:1.5rem;letter-spacing:.02em}
+.status span{font-size:.9rem;opacity:.9}
+.status.armed{background:var(--ok);color:#06210f}
+.status.cal{background:var(--warn);color:#2b1c00}
+.status.alarm{background:var(--bad);animation:pulse .7s infinite alternate}
+@keyframes pulse{to{filter:brightness(1.35)}}
+@media (prefers-reduced-motion:reduce){.status.alarm{animation:none}}
+.row{display:flex;gap:10px;margin:14px 0}
+button{flex:1;font:inherit;font-weight:600;padding:14px;border-radius:10px;border:0;background:var(--text);color:#10151a;cursor:pointer}
+button.sec{background:var(--panel);color:var(--text);border:1px solid var(--line)}
+button:disabled{opacity:.4}
+button:focus-visible,input:focus-visible{outline:3px solid #7cc4ff;outline-offset:2px}
+.live{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px}
+.live div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;text-align:center}
+.live small{display:block;color:var(--mute);font-size:.75rem}
+.live strong{font-size:1.15rem;font-variant-numeric:tabular-nums}
+details{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:14px}
+summary{cursor:pointer;font-weight:600}
+label{display:block;margin-top:10px;font-size:.85rem;color:var(--mute)}
+input[type=text],input[type=password],input[type=number]{width:100%;font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+label.chk{display:flex;gap:8px;align-items:center;color:var(--text)}
+.conn{font-size:.85rem;color:var(--mute);margin:0 0 10px}
+.conn i{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--idle);margin-right:6px}
+.conn.on i{background:var(--ok)}
+#log{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--mute);max-height:180px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;white-space:pre-wrap}
+video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+</style>
+</head>
+<body>
+<h1>CabinSentry · Sensor</h1>
+<p class="sub">Pasang di HP 1 (yang masuk ke tas). Biarkan layar tetap menyala.</p>
+
+<p class="conn" id="conn"><i></i><span>MQTT belum terhubung</span></p>
+
+<div class="status" id="status"><b id="stName">IDLE</b><span id="stHint">Belum aktif. Isi pengaturan lalu tekan ARM.</span></div>
+
+<div class="row">
+  <button id="btnArm">ARM</button>
+  <button id="btnDisarm" class="sec" disabled>Disarm / Reset</button>
+</div>
+
+<div class="live">
+  <div><small>SVM (m/s²)</small><strong id="vSvm">0.00</strong></div>
+  <div><small>Cahaya (0–255)</small><strong id="vLux">–</strong></div>
+  <div><small>Baseline</small><strong id="vBase">–</strong></div>
+</div>
+
+<details open id="cfg">
+  <summary>Pengaturan broker HiveMQ</summary>
+  <label>Host (contoh: abc123.s1.eu.hivemq.cloud)
+    <input type="text" id="host" autocomplete="off" autocapitalize="off"></label>
+  <label>Port WebSocket (TLS)
+    <input type="number" id="port" value="8884"></label>
+  <label>Username
+    <input type="text" id="user" autocomplete="off" autocapitalize="off"></label>
+  <label>Password
+    <input type="password" id="pass" autocomplete="off"></label>
+  <label>Nama kelompok (untuk topik cabinsentry/&lt;kelompok&gt;/status)
+    <input type="text" id="group" value="kelompok1" autocapitalize="off"></label>
+</details>
+
+<details>
+  <summary>Ambang batas (kalibrasi)</summary>
+  <label>Ambang gerak SVM (m/s²)
+    <input type="number" id="thrMove" value="1.5" step="0.1"></label>
+  <label>Kenaikan cahaya minimum (skala 0–255)
+    <input type="number" id="thrLight" value="25" step="1"></label>
+  <label>Pengali baseline cahaya
+    <input type="number" id="thrMult" value="2.5" step="0.1"></label>
+  <label class="chk"><input type="checkbox" id="moveOnly" checked> Gerak saja (tanpa cahaya) juga memicu LUGGAGE_MOVED</label>
+</details>
+
+<div class="row"><button class="sec" id="btnTest">Kirim tes alarm</button></div>
+<div id="log" aria-live="polite"></div>
+<video id="cam" playsinline muted></video>
+<canvas id="cv" width="16" height="16" hidden></canvas>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = ['host','port','user','pass','group','thrMove','thrLight','thrMult'];
+const COPY = {
+  IDLE:['IDLE','Belum aktif. Isi pengaturan lalu tekan ARM.',''],
+  CALIBRATING:['KALIBRASI…','Diamkan HP 3 detik, lalu masukkan ke tas.','cal'],
+  ARMED:['ARMED','Siaga. Masukkan HP ke tas dan tutup ritsleting.','armed'],
+  POCKET_TAMPERED:['POCKET_TAMPERED','Cahaya naik: ritsleting kemungkinan dibuka.','alarm'],
+  LUGGAGE_MOVED:['LUGGAGE_MOVED','Tas bergerak / diangkat.','alarm']
+};
+let client, state = 'IDLE', baseline = 0, lux = 0, lightUp = false;
+let hits = 0, lastMotionAt = 0, calSamples = [], lightTimer, wake, stream;
+
+try { FIELDS.forEach(f => { const v = localStorage.getItem('cs_' + f); if (v !== null) $(f).value = v; }); } catch (e) {}
+function saveCfg(){ try { FIELDS.forEach(f => localStorage.setItem('cs_' + f, $(f).value)); } catch (e) {} }
+function log(m){ const t = new Date().toLocaleTimeString('id-ID'); $('log').textContent = t + '  ' + m + '\n' + $('log').textContent; }
+function setConn(on, txt){ $('conn').classList.toggle('on', on); $('conn').querySelector('span').textContent = txt || (on ? 'MQTT terhubung' : 'MQTT terputus'); }
+const topic = () => 'cabinsentry/' + $('group').value.trim() + '/status';
+
+function publish(s, extra){
+  if (!client || !client.connected) { log('Gagal kirim ' + s + ' (MQTT belum terhubung)'); return; }
+  client.publish(topic(), JSON.stringify(Object.assign({ state: s, t: Date.now() }, extra || {})), { qos: 1 });
+  log('Publish → ' + s);
+}
+
+function setState(s){
+  state = s;
+  const [name, hint, cls] = COPY[s];
+  $('stName').textContent = name; $('stHint').textContent = hint;
+  $('status').className = 'status ' + cls;
+  if (s === 'ARMED' || s === 'POCKET_TAMPERED' || s === 'LUGGAGE_MOVED' || s === 'IDLE') publish(s);
+}
+
+function connect(){
+  return new Promise((resolve, reject) => {
+    if (client) { client.end(true); client = null; }
+    const url = 'wss://' + $('host').value.trim() + ':' + $('port').value.trim() + '/mqtt';
+    setConn(false, 'Menghubungkan…');
+    client = mqtt.connect(url, {
+      username: $('user').value.trim(), password: $('pass').value,
+      clientId: 'cs_sensor_' + Math.random().toString(16).slice(2, 8),
+      reconnectPeriod: 2000, connectTimeout: 8000
+    });
+    const to = setTimeout(() => reject(new Error('Timeout. Cek host, port, username, dan password.')), 10000);
+    client.on('connect', () => { clearTimeout(to); setConn(true); resolve(); });
+    client.on('close', () => setConn(false));
+    client.on('error', e => log('MQTT error: ' + e.message));
+  });
+}
+
+function onMotion(e){
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  const svm = Math.abs(Math.hypot(a.x, a.y, a.z) - 9.81);
+  $('vSvm').textContent = svm.toFixed(2);
+  if (state === 'IDLE' || state === 'CALIBRATING') return;
+  if (svm > parseFloat($('thrMove').value)) {
+    if (++hits >= 5) { lastMotionAt = Date.now(); evaluate(); }
+  } else hits = 0;
+}
+
+function sampleLight(){
+  const v = $('cam'), c = $('cv'), g = c.getContext('2d', { willReadFrequently: true });
+  if (v.readyState < 2) return;
+  g.drawImage(v, 0, 0, 16, 16);
+  const d = g.getImageData(0, 0, 16, 16).data;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  lux = sum / (d.length / 4);
+  $('vLux').textContent = lux.toFixed(1);
+  if (state === 'CALIBRATING') { calSamples.push(lux); return; }
+  if (state === 'IDLE') return;
+  lightUp = lux > baseline * parseFloat($('thrMult').value) && (lux - baseline) > parseFloat($('thrLight').value);
+  evaluate();
+}
+
+function evaluate(){
+  if (state === 'IDLE' || state === 'CALIBRATING' || state === 'LUGGAGE_MOVED') return;
+  const moved = Date.now() - lastMotionAt < 2000;
+  let next = state;
+  if (moved && (lightUp || $('moveOnly').checked)) next = 'LUGGAGE_MOVED';
+  else if (lightUp && state === 'ARMED') next = 'POCKET_TAMPERED';
+  if (next !== state) setState(next);
+}
+
+async function arm(){
+  saveCfg();
+  $('btnArm').disabled = true;
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== 'granted') throw new Error('Izin sensor gerak ditolak.');
+    }
+    await connect();
+    try { wake = await navigator.wakeLock.request('screen'); log('Wake lock aktif'); } catch (e) { log('Wake lock tidak tersedia, jaga layar tetap menyala manual.'); }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 64, height: 64 }, audio: false });
+      $('cam').srcObject = stream; await $('cam').play();
+    } catch (e) { log('Kamera gagal: ' + e.message + ' (deteksi cahaya mati)'); }
+    window.addEventListener('devicemotion', onMotion);
+    calSamples = []; lightUp = false; lastMotionAt = 0; hits = 0;
+    setState('CALIBRATING');
+    lightTimer = setInterval(sampleLight, 150);
+    await new Promise(r => setTimeout(r, 3000));
+    baseline = calSamples.length ? calSamples.reduce((a, b) => a + b, 0) / calSamples.length : 0;
+    $('vBase').textContent = baseline.toFixed(1);
+    log('Baseline cahaya = ' + baseline.toFixed(1));
+    setState('ARMED');
+    $('btnDisarm').disabled = false;
+  } catch (e) {
+    log('ERROR: ' + e.message);
+    $('btnArm').disabled = false;
+    disarm(true);
+  }
+}
+
+function disarm(silent){
+  clearInterval(lightTimer);
+  window.removeEventListener('devicemotion', onMotion);
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (wake) { wake.release().catch(() => {}); wake = null; }
+  const wasActive = state !== 'IDLE';
+  state = 'IDLE';
+  $('stName').textContent = 'IDLE'; $('stHint').textContent = COPY.IDLE[1]; $('status').className = 'status';
+  if (wasActive && !silent) publish('IDLE');
+  $('btnArm').disabled = false; $('btnDisarm').disabled = true;
+}
+
+$('btnArm').onclick = arm;
+$('btnDisarm').onclick = () => disarm(false);
+$('btnTest').onclick = async () => {
+  saveCfg();
+  try { if (!client || !client.connected) await connect(); publish('LUGGAGE_MOVED', { test: true }); }
+  catch (e) { log('ERROR: ' + e.message); }
+};
+</script>
+</body>
+</html>

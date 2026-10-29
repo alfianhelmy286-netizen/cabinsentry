@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CabinSentry · Penerima (HP 2)</title>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+:root{--bg:#10151a;--panel:#192027;--line:#2a343e;--text:#e8edf1;--mute:#8a98a5;--ok:#2fbf71;--warn:#f0a30a;--bad:#e5484d;--idle:#4a5866}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom));max-width:520px;margin:0 auto;min-height:100vh}
+body.alarm{animation:flash .6s infinite alternate}
+@keyframes flash{from{background:#10151a}to{background:#5a1418}}
+@media (prefers-reduced-motion:reduce){body.alarm{animation:none;background:#5a1418}}
+h1{font-size:1.25rem;margin:4px 0 2px}
+p.sub{margin:0 0 16px;color:var(--mute);font-size:.9rem}
+.status{border-radius:14px;padding:26px 16px;text-align:center;background:var(--idle)}
+.status b{display:block;font-size:1.5rem}
+.status span{font-size:.9rem;opacity:.9}
+.status.ok{background:var(--ok);color:#06210f}
+.status.alarm{background:var(--bad)}
+.row{display:flex;gap:10px;margin:14px 0}
+button{flex:1;font:inherit;font-weight:600;padding:14px;border-radius:10px;border:0;background:var(--text);color:#10151a;cursor:pointer}
+button.sec{background:var(--panel);color:var(--text);border:1px solid var(--line)}
+button.stop{background:#fff;color:#8a0f14;font-size:1.1rem;padding:18px}
+button:disabled{opacity:.4}
+button:focus-visible,input:focus-visible{outline:3px solid #7cc4ff;outline-offset:2px}
+details{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:14px}
+summary{cursor:pointer;font-weight:600}
+label{display:block;margin-top:10px;font-size:.85rem;color:var(--mute)}
+input{width:100%;font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+.conn{font-size:.85rem;color:var(--mute);margin:0 0 10px}
+.conn i{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--idle);margin-right:6px}
+.conn.on i{background:var(--ok)}
+#log{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--mute);max-height:220px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>CabinSentry · Penerima</h1>
+<p class="sub">Pasang di HP 2 (di saku celana). Tekan Mulai Dengarkan sekali supaya suara dan getar diizinkan.</p>
+
+<p class="conn" id="conn"><i></i><span>MQTT belum terhubung</span></p>
+<div class="status" id="status"><b id="stName">Belum mendengarkan</b><span id="stHint">Isi pengaturan lalu tekan Mulai Dengarkan.</span></div>
+
+<div class="row">
+  <button id="btnStart">Mulai Dengarkan</button>
+  <button id="btnStop" class="sec" disabled>Berhenti</button>
+</div>
+<div class="row" id="stopRow" hidden><button class="stop" id="btnSilence">MATIKAN ALARM</button></div>
+
+<details open>
+  <summary>Pengaturan broker HiveMQ</summary>
+  <label>Host (contoh: abc123.s1.eu.hivemq.cloud)
+    <input type="text" id="host" autocomplete="off" autocapitalize="off"></label>
+  <label>Port WebSocket (TLS)
+    <input type="number" id="port" value="8884"></label>
+  <label>Username
+    <input type="text" id="user" autocomplete="off" autocapitalize="off"></label>
+  <label>Password
+    <input type="password" id="pass" autocomplete="off"></label>
+  <label>Nama kelompok (harus sama dengan HP 1)
+    <input type="text" id="group" value="kelompok1" autocapitalize="off"></label>
+</details>
+
+<div id="log" aria-live="polite"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = ['host','port','user','pass','group'];
+let client, audio, beepTimer, vibTimer, wake, alarmOn = false, flip = false;
+
+try { FIELDS.forEach(f => { const v = localStorage.getItem('cs_' + f); if (v !== null) $(f).value = v; }); } catch (e) {}
+function saveCfg(){ try { FIELDS.forEach(f => localStorage.setItem('cs_' + f, $(f).value)); } catch (e) {} }
+function log(m){ const t = new Date().toLocaleTimeString('id-ID'); $('log').textContent = t + '  ' + m + '\n' + $('log').textContent; }
+function setConn(on, txt){ $('conn').classList.toggle('on', on); $('conn').querySelector('span').textContent = txt || (on ? 'MQTT terhubung' : 'MQTT terputus'); }
+function show(name, hint, cls){ $('stName').textContent = name; $('stHint').textContent = hint; $('status').className = 'status ' + (cls || ''); }
+
+function beep(){
+  if (!audio) return;
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.type = 'square'; o.frequency.value = (flip = !flip) ? 880 : 660;
+  g.gain.value = 0.35; o.connect(g); g.connect(audio.destination);
+  o.start(); o.stop(audio.currentTime + 0.3);
+}
+function startAlarm(state, latency){
+  const txt = state === 'POCKET_TAMPERED' ? 'Ritsleting tas dibuka orang lain.' : 'Tas sedang diangkat / dicuri.';
+  show('ALARM: ' + state, txt + (latency != null ? ' (±' + latency + ' ms)' : ''), 'alarm');
+  document.body.classList.add('alarm'); $('stopRow').hidden = false;
+  if (alarmOn) return;
+  alarmOn = true;
+  beep(); beepTimer = setInterval(beep, 400);
+  if (navigator.vibrate) { navigator.vibrate([500, 200, 500]); vibTimer = setInterval(() => navigator.vibrate([500, 200, 500]), 1500); }
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try { new Notification('CabinSentry: ' + state, { body: txt, requireInteraction: true }); } catch (e) {}
+  }
+}
+function silence(){
+  alarmOn = false; clearInterval(beepTimer); clearInterval(vibTimer);
+  if (navigator.vibrate) navigator.vibrate(0);
+  document.body.classList.remove('alarm'); $('stopRow').hidden = true;
+  show('Mendengarkan', 'Menunggu status dari HP 1.', 'ok');
+}
+
+async function start(){
+  saveCfg();
+  $('btnStart').disabled = true;
+  try { audio = new (window.AudioContext || window.webkitAudioContext)(); await audio.resume(); } catch (e) { log('Audio gagal: ' + e.message); }
+  if ('Notification' in window && Notification.permission === 'default') { try { await Notification.requestPermission(); } catch (e) {} }
+  try { wake = await navigator.wakeLock.request('screen'); } catch (e) { log('Wake lock tidak tersedia.'); }
+  if (client) client.end(true);
+  const url = 'wss://' + $('host').value.trim() + ':' + $('port').value.trim() + '/mqtt';
+  const topic = 'cabinsentry/' + $('group').value.trim() + '/status';
+  setConn(false, 'Menghubungkan…');
+  client = mqtt.connect(url, {
+    username: $('user').value.trim(), password: $('pass').value,
+    clientId: 'cs_receiver_' + Math.random().toString(16).slice(2, 8),
+    reconnectPeriod: 2000, connectTimeout: 8000
+  });
+  client.on('connect', () => {
+    setConn(true);
+    client.subscribe(topic, { qos: 1 }, err => {
+      if (err) { log('Subscribe gagal: ' + err.message); return; }
+      log('Subscribe ke ' + topic);
+      if (!alarmOn) show('Mendengarkan', 'Menunggu status dari HP 1.', 'ok');
+      $('btnStop').disabled = false;
+    });
+  });
+  client.on('close', () => setConn(false));
+  client.on('error', e => { log('MQTT error: ' + e.message); $('btnStart').disabled = false; });
+  client.on('message', (_, buf) => {
+    const raw = buf.toString(); let state = raw, latency = null;
+    try { const j = JSON.parse(raw); state = j.state; if (j.t) latency = Math.max(0, Date.now() - j.t); } catch (e) {}
+    log('Diterima: ' + state + (latency != null ? ' (±' + latency + ' ms)' : ''));
+    if (state === 'POCKET_TAMPERED' || state === 'LUGGAGE_MOVED') startAlarm(state, latency);
+    else if (state === 'ARMED') { if (!alarmOn) show('HP 1 ARMED', 'Sensor siaga.', 'ok'); }
+    else if (state === 'IDLE') { if (alarmOn) silence(); show('HP 1 IDLE', 'Sensor dimatikan.', ''); }
+  });
+}
+function stop(){
+  silence();
+  if (client) { client.end(true); client = null; }
+  if (wake) { wake.release().catch(() => {}); wake = null; }
+  setConn(false); show('Belum mendengarkan', 'Isi pengaturan lalu tekan Mulai Dengarkan.', '');
+  $('btnStart').disabled = false; $('btnStop').disabled = true;
+}
+$('btnStart').onclick = start;
+$('btnStop').onclick = stop;
+$('btnSilence').onclick = silence;
+</script>
+</body>
+</html>
